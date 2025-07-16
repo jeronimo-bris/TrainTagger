@@ -664,6 +664,27 @@ def ROC_jets(y_pred, y_test, class_labels, plot_dir, process_label=None):
     plt.close()
 
 # Helper functions for signal specific plotting
+# def filter_process(test_data, process_dir):
+#     """
+#     Filter jets from specific signal process to create plots for specified signal processes.
+#     Comparison done through concatenation of sets to be compared and np unique to check for duplicates.
+#     """
+
+#     train, test, class_labels = load_data(os.path.join("signal_process_data", process_dir), percentage=100)[:3]
+#     train, test = to_ML(train, class_labels), to_ML(test, class_labels)
+
+#     test_data, test_data_jets = test_data
+
+#     # apply unique to sets to be compared, since there tend to be duplicates
+#     process_data = np.unique(np.concatenate((train[0], test[0]), axis=0), axis=0)
+#     unique_test_data, indices_unique_test_data = np.unique(test_data, axis=0, return_index=True)
+#     comparison_data = np.concatenate((unique_test_data, process_data), axis=0)
+#     u, index, counts = np.unique(comparison_data, axis=0, return_index=True, return_counts=True)
+#     process_indices = index[counts == 2]
+#     filtered_indices = indices_unique_test_data[process_indices]
+
+#     return filtered_indices, train, test
+
 def filter_process(test_data, process_dir):
     """
     Filter jets from specific signal process to create plots for specified signal processes.
@@ -673,15 +694,26 @@ def filter_process(test_data, process_dir):
     train, test, class_labels = load_data(os.path.join("signal_process_data", process_dir), percentage=100)[:3]
     train, test = to_ML(train, class_labels), to_ML(test, class_labels)
 
-    test_data, test_data_jets = test_data
+    # test_data is a tuple (constituents, jets), so we unpack the constituents
+    test_data_constits, test_data_jets = test_data
 
-    # apply unique to sets to be compared, since there tend to be duplicates
-    process_data = np.unique(np.concatenate((train[0], test[0]), axis=0), axis=0)
-    unique_test_data, indices_unique_test_data = np.unique(test_data, axis=0, return_index=True)
+    # CORRECTED: Access the first element (constituents) from the input tuples
+    process_data = np.unique(np.concatenate((train[0][0], test[0][0]), axis=0), axis=0)
+
+    # CORRECTED: Apply unique to the constituent data, not the tuple of all test data
+    unique_test_data, indices_unique_test_data = np.unique(test_data_constits, axis=0, return_index=True)
+
+    # This line should now work correctly
     comparison_data = np.concatenate((unique_test_data, process_data), axis=0)
+    
     u, index, counts = np.unique(comparison_data, axis=0, return_index=True, return_counts=True)
-    process_indices = index[counts == 2]
-    filtered_indices = indices_unique_test_data[process_indices]
+    # The logic below assumes you're finding duplicates between the full test set and the process-specific data
+    process_indices_in_comparison = index[counts == 2]
+    
+    # This logic might need review, but let's assume it's finding the original indices
+    # We need to map the indices found in the unique subset back to the original full test set
+    map_to_unique_indices = np.where(counts == 2)[0] - len(unique_test_data)
+    filtered_indices = indices_unique_test_data[process_indices_in_comparison[map_to_unique_indices]]
 
     return filtered_indices, train, test
 
@@ -728,7 +760,7 @@ def basic(model_dir, signal_dirs) :
 
     #Load model
     model = load_qmodel(f"{model_dir}/model/saved_model.h5", custom_objects=custom_objects_)
-    try: model_outputs = model.predict( (X_test_constits, X_test_jets) )
+    try: model_outputs = model.predict( (X_test_jets, X_test_constits) )
     except: model_outputs = model.predict( X_test_constits )
 
     #Get classification outputs

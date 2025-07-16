@@ -51,12 +51,12 @@ def prune_model(model, num_samples):
 
     # Define the pruned model
     pruning_params = {'pruning_schedule': tfmot.sparsity.keras.PolynomialDecay(initial_sparsity=I_SPARSITY, final_sparsity=F_SPARSITY, begin_step=0, end_step=end_step)}
-    pruned_model = tfmot.sparsity.keras.prune_low_magnitude(model, **pruning_params)
+    pruned_model = model#tfmot.sparsity.keras.prune_low_magnitude(model, **pruning_params)
 
     pruned_model.compile(optimizer='adam',
-                            loss={'prune_low_magnitude_jet_id_output': 'categorical_crossentropy', 'prune_low_magnitude_pT_output': tf.keras.losses.Huber()},
-                            metrics = {'prune_low_magnitude_jet_id_output': 'categorical_accuracy', 'prune_low_magnitude_pT_output': ['mae', 'mean_squared_error']},
-                            weighted_metrics = {'prune_low_magnitude_jet_id_output': 'categorical_accuracy', 'prune_low_magnitude_pT_output': ['mae', 'mean_squared_error']},
+                            loss={'jet_id_output': 'categorical_crossentropy', 'pT_output': tf.keras.losses.Huber()},
+                            # metrics = {'jet_id_output': 'categorical_accuracy', 'prune_low_magnitude_pT_output': ['mae', 'mean_squared_error']},
+                            # weighted_metrics = {'prune_low_magnitude_jet_id_output': 'categorical_accuracy', 'prune_low_magnitude_pT_output': ['mae', 'mean_squared_error']},
                             loss_weights = LOSS_WEIGHTS)
 
     print(pruned_model.summary())
@@ -225,7 +225,7 @@ def train(out_dir, percent, model_name, new_epochs = None, use_jets = False):
         input_shape = (X_train_constits.shape[1:], X_train_jets.shape[1:])
     else:
         inputs =  {'model_input': X_train_constits}
-        input_shape = X_train_constits[1:]
+        input_shape = X_train_constits.shape[1:]
 
     # Dynamically get the model
     try:
@@ -245,8 +245,8 @@ def train(out_dir, percent, model_name, new_epochs = None, use_jets = False):
 
     history = pruned_model.fit(
         inputs,
-        {'prune_low_magnitude_jet_id_output': y_train, 'prune_low_magnitude_pT_output': pt_target_train},
-        sample_weight=sample_weight,
+        {'jet_id_output': y_train, 'pT_output': pt_target_train},
+        # sample_weight=sample_weight,
         epochs=EPOCHS,
         batch_size=BATCH_SIZE,
         verbose=2,
@@ -256,7 +256,7 @@ def train(out_dir, percent, model_name, new_epochs = None, use_jets = False):
         )
     
     # Export the model
-    model_export = tfmot.sparsity.keras.strip_pruning(pruned_model)
+    model_export = pruned_model #tfmot.sparsity.keras.strip_pruning(pruned_model)
 
     export_path = os.path.join(out_dir, "model/saved_model.h5")
     model_export.save(export_path)
@@ -277,9 +277,9 @@ if __name__ == "__main__":
 
     # Making input arguments
     parser.add_argument('--make-data', action='store_true', help='Prepare the data if set.')
-    parser.add_argument('-i','--input', default='/eos/cms/store/cmst3/group/l1tr/sewuchte/l1teg/fp_jettuples_090125/All200.root' , help = 'Path to input training data')
+    parser.add_argument('-i','--input', default='/dice/projects/L1T/TrainTagger/All200.root' , help = 'Path to input training data')
     parser.add_argument('-r','--ratio', default=1, type=float, help = 'Ratio (0-1) of the input data root file to process')
-    parser.add_argument('-s','--step', default='100MB' , help = 'The maximum memory size to process input root file')
+    parser.add_argument('-s','--step', default='10MB' , help = 'The maximum memory size to process input root file')
     parser.add_argument('-e','--extras', default='extra_fields', help= 'Which extra fields to add to output tuples, in pfcand_fields.yml')
 
     # Training argument

@@ -6,6 +6,7 @@ import numpy as np
 import awkward as ak
 import tensorflow as tf
 import uproot, yaml
+from sklearn.preprocessing import MinMaxScaler
 
 # Dataset configuration
 from .config import FILTER_PATTERN, N_PARTICLES, INPUT_TAG, EXTRA_FIELDS
@@ -91,6 +92,23 @@ def _split_flavor(data):
         ),
     }
 
+    # conditions = {
+    #     "b": (  # Bottom
+    #         genmatch_pt_base &
+    #         (data['jet_muflav'] == 0) &
+    #         (data['jet_tauflav'] == 0) &
+    #         (data['jet_elflav'] == 0) &
+    #         (data['jet_genmatch_hflav'] == 5)
+    #     ),
+    #     "other": ~(
+    #         genmatch_pt_base &
+    #         (data['jet_muflav'] == 0) &
+    #         (data['jet_tauflav'] == 0) &
+    #         (data['jet_elflav'] == 0) &
+    #         (data['jet_genmatch_hflav'] == 5)
+    #     )
+    # }
+
     # Automatically generate class labels based on the order of keys in conditions
     class_labels = {label: idx for idx, label in enumerate(conditions)}
 
@@ -124,6 +142,49 @@ def _split_flavor(data):
         raise ValueError(f"Data splitting error: Total entries ({split_data_sum}) do not match the filtered data length ({len(data[jet_ptmin_gen])}).")
 
     return data[jet_ptmin_gen], class_labels
+
+    # Automatically generate class labels based on the order of keys in conditions
+    # class_labels = {label: idx for idx, label in enumerate(conditions)}
+
+    # # Initialize the new array in data for numeric labels with default -1 for unmatched entries
+    # data['class_label'] = ak.full_like(data['jet_genmatch_pt'], -1)
+
+    # # Assign numeric values based on conditions using awkward's where function
+    # for label, condition in conditions.items():
+    #     data['class_label'] = ak.where(condition, class_labels[label], data['class_label'])
+
+    # # Set pt regression target
+    # # Now only "b" is treated as hadron, everything else is "other"
+    # hadrons = conditions["b"]
+    # leptons = conditions["other"] & (  # Leptonic jets are a subset of "other"
+    #     (data['jet_muflav'] == 1) |
+    #     (data['jet_tauflav'] == 1) |
+    #     (data['jet_elflav'] == 1)
+    # )
+
+    # # Calculate pt ratios
+    # hadron_pt_ratio = ak.nan_to_num(data["jet_genmatch_pt"] / data["jet_pt_phys"], nan=0, posinf=0, neginf=0)
+    # lepton_pt_ratio = ak.nan_to_num(data["jet_genmatch_lep_vis_pt"] / data["jet_pt_phys"], nan=0, posinf=0, neginf=0)
+
+    # hadron_pt = ak.nan_to_num(data["jet_genmatch_pt"], nan=0, posinf=0, neginf=0)
+    # lepton_pt = ak.nan_to_num(data["jet_genmatch_lep_vis_pt"], nan=0, posinf=0, neginf=0)
+
+    # # Assign pt targets
+    # data['target_pt'] = np.clip(hadrons * hadron_pt_ratio + leptons * lepton_pt_ratio, 0.3, 2)
+    # data['target_pt_phys'] = hadrons * hadron_pt + leptons * lepton_pt
+
+    # # Apply pt_cut
+    # jet_ptmin_gen = data['target_pt_phys'] > 5.
+    # for key in conditions:
+    #     conditions[key] = conditions[key] & jet_ptmin_gen
+
+    # # Sanity check for data consistency
+    # split_data_sum = sum(sum(condition) for condition in conditions.values())
+    # if split_data_sum != len(data[jet_ptmin_gen]):
+    #     raise ValueError(f"Data splitting error: Total entries ({split_data_sum}) do not match the filtered data length ({len(data[jet_ptmin_gen])}).")
+
+    # return data[jet_ptmin_gen], class_labels
+
 
 def _get_pfcand_fields(tag):
     
@@ -249,19 +310,23 @@ def extract_nn_inputs(data, input_vars, n_parts=16 ,n_entries=None):
     """
 
     #Concatenate all the inputs
-    inputs_list = []
+    constit_inputs_list, jet_inputs_list = [], []
 
     for field in input_vars:
+        if field.split("_")[0] == "jet":
+            field_array = extract_array(data, f"{field}", n_entries)
+            jet_inputs_list.append(field_array[:, np.newaxis])
+        else:
+            field_array = extract_array(data, f"jet_pfcand_{field}", n_entries)
 
-        field_array = extract_array(data, f"jet_pfcand_{field}", n_entries)
-
-        padded_filled_array = _pad_fill(field_array, n_parts)
-        inputs_list.append(padded_filled_array[:,:,np.newaxis])
+            padded_filled_array = _pad_fill(field_array, n_parts)
+            constit_inputs_list.append(padded_filled_array[:, :, np.newaxis])
 
     #batch_size, n_particles, n_features
-    inputs = ak.concatenate(inputs_list, axis=2)
+    constit_inputs = ak.concatenate(constit_inputs_list, axis=2)
+    jet_inputs = ak.concatenate(jet_inputs_list, axis=1)
 
-    return inputs
+    return constit_inputs, jet_inputs
 
 def group_id_values(event_id, *arrays, num_elements = 2):
     '''
@@ -290,8 +355,31 @@ def to_ML(data, class_labels):
     """
     Take in the data from make_data (loaded by load_data) and make them ready for training.
     """
+    constit_features = np.asarray(data['nn_inputs'])  # shape (N, 16, 20)
 
-    X = ( np.asarray( data['nn_inputs'] ), np.asarray( data['nn_jet_inputs'] ) )
+    # # Copy to avoid modifying original data unless desired
+    constit_features = constit_features.copy()
+
+    # Apply MinMaxScaler to columns 0,1,2,5,14
+    scaler = MinMaxScaler()
+    cols_to_scale = [0, 1, 2, 5, 14]
+
+    # Reshape these columns to (N*16, 1) for fitting and transforming
+    for col in cols_to_scale:
+        flat_col = constit_features[:, :, col].reshape(-1, 1)
+        scaled_flat_col = scaler.fit_transform(flat_col)
+        constit_features[:, :, col] = scaled_flat_col.reshape(constit_features.shape[0], constit_features.shape[1])
+
+    # Divide columns 3 and 4 by 184
+    constit_features[:, :, 3] /= 184
+    constit_features[:, :, 4] /= 184
+
+    # Divide column 15 by its max
+    max_val_15 = np.max(constit_features[:, :, 15])
+    if max_val_15 != 0:
+        constit_features[:, :, 15] /= max_val_15
+
+    X = ( constit_features, np.asarray( data['nn_jet_inputs'] ) )
     y = tf.keras.utils.to_categorical(np.asarray(data['class_label']), num_classes=len(class_labels))
     pt_target = np.asarray(data['target_pt'])
     truth_pt = np.asarray(data['target_pt_phys'])

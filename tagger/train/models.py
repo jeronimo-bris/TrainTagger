@@ -3,7 +3,9 @@ Here all the models are defined to be called in train.py
 """
 import tensorflow as tf
 import tensorflow_model_optimization as tfmot
-from tensorflow.keras.layers import BatchNormalization, Input, Activation, GlobalAveragePooling1D, GlobalMaxPooling1D, Concatenate, Layer
+from tensorflow.keras.layers import BatchNormalization, Input, Activation, GlobalAveragePooling1D, GlobalMaxPooling1D, Concatenate, Layer, Conv1D, Dense
+from keras import activations
+import tensorflow_addons as tfa # MODIFICATION: Import tensorflow_addons
 
 # Qkeras
 from qkeras.quantizers import quantized_bits, quantized_relu
@@ -186,11 +188,10 @@ def baseline_larger(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val=1,
     return baseline(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val=1, 
             aggregator = "mean",conv1d_layers = [30, 15, 10], class_layers = [32, 16, 8], reg_layers = [16, 8, 4])
 
-
 def baseline_with_jets(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val=1, 
              aggregator="mean", conv1d_layers=[10, 10], class_layers=[32, 16], reg_layers=[10]):
 
-    from tensorflow.keras.constraints import NonNeg
+    # from tensorflow.keras.constraints import NonNeg
     # Common quantization args
     common_args = {
         'kernel_quantizer': quantized_bits(bits, bits_int, alpha=alpha_val),
@@ -216,23 +217,22 @@ def baseline_with_jets(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val
 
     # Optional jet-level inputs
     if jets_shape is not None:
-        jet_inputs = tf.keras.layers.Input(shape=jets_shape, name='jet_input')
-        jet_pt_input = tf.keras.layers.Lambda(lambda x: x[:, 0:1], name='jet_pt_input')(jet_inputs)  # Assume pt is at index 0
-        jet_other_inputs = tf.keras.layers.Lambda(lambda x: x[:, 1:], name='jet_other_inputs')(jet_inputs)
-
-        # Normalize only the other jet inputs
-        jet_other_inputs_norm = BatchNormalization(name='norm_jet_other_input')(jet_other_inputs)
-
-        # Concatenate jet pt with normalized other inputs
-        jet_inputs_combined = tf.keras.layers.Concatenate(name='recombine_jet_inputs')([jet_pt_input, jet_other_inputs_norm])
-
-        main = tf.keras.layers.Concatenate(name='combine_features')([main, jet_inputs_combined])
-        inputs["jet_input"] = jet_inputs
-
         # jet_inputs = tf.keras.layers.Input(shape=jets_shape, name='jet_input')
-        # jet_branch = BatchNormalization(name='norm_jet_input')(jet_inputs)
-        # main = tf.keras.layers.Concatenate(name='combine_features')([main, jet_branch])
-        # inputs.append(jet_inputs)
+        # jet_pt_input = tf.keras.layers.Lambda(lambda x: x[:, 0:1], name='jet_pt_input')(jet_inputs)  # Assume pt is at index 0
+        # jet_other_inputs = tf.keras.layers.Lambda(lambda x: x[:, 1:], name='jet_other_inputs')(jet_inputs)
+
+        # # Normalize only the other jet inputs
+        # jet_other_inputs_norm = BatchNormalization(name='norm_jet_other_input')(jet_other_inputs)
+
+        # # Concatenate jet pt with normalized other inputs
+        # jet_inputs_combined = tf.keras.layers.Concatenate(name='recombine_jet_inputs')([jet_pt_input, jet_other_inputs_norm])
+
+        # main = tf.keras.layers.Concatenate(name='combine_features')([main, jet_inputs_combined])
+
+        jet_inputs = tf.keras.layers.Input(shape=jets_shape, name='jet_input')
+        jet_branch = BatchNormalization(name='norm_jet_input')(jet_inputs)
+        main = tf.keras.layers.Concatenate(name='combine_features')([main, jet_branch])
+        inputs["jet_input"] = jet_inputs
 
     # Jet ID classification
     jet_id = main
@@ -240,8 +240,8 @@ def baseline_with_jets(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val
         jet_id = QDense(
             depthclass,
             name=f'Dense_{iclass+1}_jetID',
-            kernel_constraint=NonNeg(),
-            bias_constraint=NonNeg(),
+            # kernel_constraint=NonNeg(),
+            # bias_constraint=NonNeg(),
             **common_args
             )(jet_id)
         jet_id = QActivation(activation=quantized_relu(bits, 0), name=f'relu_{iclass+1}_jetID')(jet_id)
@@ -249,8 +249,8 @@ def baseline_with_jets(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val
     jet_id = QDense(
         output_shape[0],
         name=f'Dense_{len(class_layers)+1}_jetID',
-        kernel_constraint=NonNeg(),
-        bias_constraint=NonNeg(),
+        # kernel_constraint=NonNeg(),
+        # bias_constraint=NonNeg(),
         **common_args
         )(jet_id)
     jet_id = Activation('softmax', name='jet_id_output')(jet_id)
@@ -268,6 +268,122 @@ def baseline_with_jets(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val
 
     # Final model
     model = tf.keras.Model(inputs=inputs, outputs=[jet_id, pt_regress])
+    print(model.summary())
+    return model
+
+def baseline_lipschitz(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val=1, 
+                       aggregator="mean", conv1d_layers=[10, 10], class_layers=[32, 16], reg_layers=[10]):
+
+    inputs = Input(shape=inputs_shape, name='model_input')
+
+    # MODIFICATION: BatchNormalization removed. 
+    # Its Lipschitz constant is not guaranteed to be 1.
+    main = inputs
+
+    # Make Conv1D layers
+    for iconv1d, depthconv1d in enumerate(conv1d_layers):
+        # MODIFICATION: Wrap QConv1D with SpectralNormalization
+        conv_layer = Conv1D(filters=depthconv1d, kernel_size=1, name='Conv1D_'+str(iconv1d+1))
+        main = tfa.layers.SpectralNormalization(conv_layer)(main)
+        main = Activation(activation=activations.relu, name='relu_'+str(iconv1d+1))(main)
+
+    # main = QActivation(activation='quantized_bits(18,8)', name='act_pool')(main)
+    agg = choose_aggregator(choice=aggregator, name="pool")
+    main = agg(main)
+
+    # Classification branch
+    jet_id_branch = main
+    for iclass, depthclass in enumerate(class_layers):
+        # MODIFICATION: Wrap QDense with SpectralNormalization
+        dense_layer = Dense(depthclass, name='Dense_'+str(iclass+1)+'_jetID')
+        jet_id_branch = tfa.layers.SpectralNormalization(dense_layer)(jet_id_branch)
+        jet_id_branch = Activation(activation=activations.relu, name='relu_'+str(iclass+1)+'_jetID')(jet_id_branch)
+
+    # MODIFICATION: Wrap final classification layer
+    output_jet_id_layer = Dense(output_shape[0], name='Dense_'+str(len(class_layers)+1)+'_jetID')
+    jet_id_branch = tfa.layers.SpectralNormalization(output_jet_id_layer)(jet_id_branch)
+    jet_id_output = Activation('softmax', name='jet_id_output')(jet_id_branch)
+
+    # Regression branch
+    pt_regress_branch = main
+    for ireg, depthreg in enumerate(reg_layers):
+        dense_layer = Dense(depthreg, name='Dense_'+str(ireg+1)+'_pT')
+        pt_regress_branch = tfa.layers.SpectralNormalization(dense_layer)(pt_regress_branch)
+        pt_regress_branch = Activation(activation=activations.relu, name='relu_'+str(ireg+1)+'_pT')(pt_regress_branch)
+
+    # Define final regression layer
+    output_pt_layer = Dense(1, name='pT_output',
+                             kernel_initializer='lecun_uniform')
+    
+    # Apply spectral norm
+    pt_regress_tensor = tfa.layers.SpectralNormalization(output_pt_layer)(pt_regress_branch)
+
+    # FIX: Explicitly name the final output tensor.
+    # This ensures the model's output name is 'pT_output', matching what the loss function expects.
+    pt_regress_output = Activation('linear', name='pT_output')(pt_regress_tensor)
+
+    # Define the model using both branches
+    model = tf.keras.Model(inputs=inputs, outputs=[jet_id_output, pt_regress_output])
+    print(model.summary())
+    return model
+
+def baseline_lipschitz_with_jets(inputs_shape, output_shape, bits=9, bits_int=2, alpha_val=1, 
+                       aggregator="mean", conv1d_layers=[10, 10], class_layers=[32, 16], reg_layers=[10]):
+    
+    # Unpack input shapes
+    constituents_shape, jets_shape = inputs_shape
+
+    # Define inputs
+    constituent_inputs = Input(shape=constituents_shape, name='model_input')
+    inputs = {"model_input": constituent_inputs}
+    
+    main = constituent_inputs
+
+    # Apply Conv1D layers with spectral normalization
+    for iconv1d, depthconv1d in enumerate(conv1d_layers):
+        conv_layer = Conv1D(filters=depthconv1d, kernel_size=1, name=f'Conv1D_{iconv1d+1}')
+        main = tfa.layers.SpectralNormalization(conv_layer)(main)
+        main = Activation(activation=activations.relu, name=f'relu_{iconv1d+1}')(main)
+
+    # Aggregate sequence
+    agg = choose_aggregator(choice=aggregator, name="pool")
+    main = agg(main)
+
+    # Optional jet-level inputs
+    if jets_shape is not None:
+        jet_inputs = Input(shape=jets_shape, name='jet_input')
+        inputs["jet_input"] = jet_inputs
+
+        # Normalize the jet inputs (optional)
+        # jet_branch = BatchNormalization(name='norm_jet_input')(jet_inputs)
+
+        # Concatenate with aggregated constituent features
+        main = Concatenate(name='combine_features')([main, jet_inputs])
+
+    # Jet ID branch
+    jet_id = main
+    for iclass, depthclass in enumerate(class_layers):
+        dense_layer = Dense(depthclass, name=f'Dense_{iclass+1}_jetID')
+        jet_id = tfa.layers.SpectralNormalization(dense_layer)(jet_id)
+        jet_id = Activation(activation=activations.relu, name=f'relu_{iclass+1}_jetID')(jet_id)
+
+    final_jet_id_layer = Dense(output_shape[0], name=f'Dense_{len(class_layers)+1}_jetID')
+    jet_id = tfa.layers.SpectralNormalization(final_jet_id_layer)(jet_id)
+    jet_id_output = Activation('softmax', name='jet_id_output')(jet_id)
+
+    # pT regression branch
+    pt_regress = main
+    for ireg, depthreg in enumerate(reg_layers):
+        dense_layer = Dense(depthreg, name=f'Dense_{ireg+1}_pT')
+        pt_regress = tfa.layers.SpectralNormalization(dense_layer)(pt_regress)
+        pt_regress = Activation(activation=activations.relu, name=f'relu_{ireg+1}_pT')(pt_regress)
+
+    final_pt_layer = Dense(1, name='pT_output', kernel_initializer='lecun_uniform')
+    pt_regress = tfa.layers.SpectralNormalization(final_pt_layer)(pt_regress)
+    pt_regress_output = Activation('linear', name='pT_output')(pt_regress)
+
+    # Build model
+    model = tf.keras.Model(inputs=inputs, outputs=[jet_id_output, pt_regress_output])
     print(model.summary())
     return model
 

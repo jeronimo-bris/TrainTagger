@@ -1,33 +1,26 @@
+import os
 from argparse import ArgumentParser
-import os, shutil, json
-
-#Import from other modules
-from tagger.data.tools import make_data, load_data, to_ML
-from tagger.firmware.hls4ml_convert import convert
-import tagger.train.models
-from tagger.plot.common import plot_2d
-
-#Third parties
-import numpy as np
-import tensorflow as tf
-import tensorflow_model_optimization as tfmot
-import hls4ml
-from qkeras.utils import load_qmodel
-from sklearn.metrics import roc_curve, auc,precision_recall_curve
-import mlflow
 from pathlib import Path
 
+import hls4ml
 import matplotlib.pyplot as plt
-import mplhep as hep
-import tagger.plot.style as style
+import numpy as np
+
+from tagger.data.tools import load_data, make_data, to_ML
+from tagger.model.common import fromFolder
+
+# Import from other modules
+from tagger.plot import style
+from tagger.plot.common import plot_2d
+
+from hls4ml.model import profiling
 
 style.set_style()
 
+
 def getReports(indir):
     data_ = {}
-
-    report_csynth = Path('{}/L1TSC4NGJetModel_test_prj/solution1/syn/report/L1TSC4NGJetModel_test_csynth.rpt'.format(indir))
-
+    report_csynth = Path('{}/L1TSC4NGJetModel_prj/solution1/syn/report/L1TSC4NGJetModel_csynth.rpt'.format(indir))
     if report_csynth.is_file():
         print('Found valid vsynth and synth in {}! Fetching numbers'.format(indir))
 
@@ -35,138 +28,165 @@ def getReports(indir):
             lines = np.array(report.readlines())
             lat_line = lines[np.argwhere(np.array(['Latency (cycles)' in line for line in lines])).flatten()[0] + 3]
             data_['latency_clks'] = int(lat_line.split('|')[2])
-            data_['latency_mus']  = float(lat_line.split('|')[2])*5.0/1000.
-            data_['latency_ii']   = int(lat_line.split('|')[6])
+            data_['latency_ii'] = int(lat_line.split('|')[6])
 
             resource_line = lines[np.argwhere(np.array(['|Utilization (%)' in line for line in lines])).flatten()[0]]
             try:
-                data_['bram_rel']     = int(resource_line.split('|')[2])
+                data_['bram_rel'] = int(resource_line.split('|')[2])
             except ValueError:
-                data_['bram_rel']     = 0
-            data_['dsp_rel']     = int(resource_line.split('|')[3])
-            data_['ff_rel']     = int(resource_line.split('|')[4])
-            data_['lut_rel']     = int(resource_line.split('|')[5])
+                data_['bram_rel'] = 0
+
+            data_['dsp_rel'] = int(resource_line.split('|')[3])
+            data_['ff_rel'] = int(resource_line.split('|')[4])
+            data_['lut_rel'] = int(resource_line.split('|')[5])
 
             total_line = lines[np.argwhere(np.array(['|Total ' in line for line in lines])).flatten()[0]]
-            data_['bram']     = int(total_line.split('|')[2])
-            data_['dsp']     = int(total_line.split('|')[3])
-            data_['ff']     = int(total_line.split('|')[4])
-            data_['lut']     = int(total_line.split('|')[5])
+            data_['bram'] = int(total_line.split('|')[2])
+            data_['dsp'] = int(total_line.split('|')[3])
+            data_['ff'] = int(total_line.split('|')[4])
+            data_['lut'] = int(total_line.split('|')[5])
 
     return data_
 
-def doPlots(model,outputdir,inputdir):
+
+def doPlots(model, outputdir, inputdir):
     os.makedirs(outputdir, exist_ok=True)
 
-    modelsAndNames = {"model":model}
-
-    data, _, class_labels, input_vars, extra_vars = load_data(inputdir, percentage=100,test_ratio=0.0)
-    X_test, Y_test, pt_target, truth_pt, _ = to_ML(data, class_labels)
+    data, _, class_labels, input_vars, jet_vars, extra_vars = load_data(inputdir, percentage=100, model=model, test_ratio=0.0)
+    particle_features_test, jet_features, Y_test, pt_target, truth_pt, reco_pt = to_ML(data, class_labels)
 
     labels = list(class_labels.keys())
 
-    hls_model = convert(model,"temp",build=False)
-    y_hls, y_ptreg_hls = hls_model.predict(np.ascontiguousarray(X_test))
-    y_class, y_ptreg = model.predict(np.ascontiguousarray(X_test))
+    raw_inputs_dict = {
+        "basic_input": particle_features_test,
+        "jet_features": jet_features,
+    }
+
+    model.firmware_convert("temp", build=False)
+
+    model_dict, _ = model.prepare_inputs(raw_inputs_dict)
+    model_dict = {key: np.ascontiguousarray(model_dict[key], dtype=np.float64) for key in model_dict.keys()}
+    hls_inputs = []
+    for var in model.hls_jet_model.get_input_variables():
+        name = var.name
+        hls_inputs.append(model_dict[name])
+    hls_inputs = hls_inputs[0] if len(hls_inputs) == 1 else hls_inputs
+    y_hls, y_ptreg_hls = model.hls_jet_model.predict(hls_inputs)
+    y_class, y_ptreg = model.jet_model.predict(model_dict)
 
     for i, label in enumerate(labels):
         plt.clf()
-        min_x = min(np.amin(y_hls[:,i]), np.amin(y_class[:,i]))
-        max_x = max(np.amax(y_hls[:,i]), np.amax(y_class[:,i]))
-        figure = plot_2d(np.array(y_class[:,i]), np.array(y_hls[:,i]) ,(min_x,max_x),(min_x,max_x),"Tensorflow","hls4ml",style.CLASS_LABEL_STYLE[label]+" score")
-        plt.savefig("%s/%s_score_2D.png" % (outputdir,label),bbox_inches='tight')
-        plt.savefig("%s/%s_score_2D.pdf" % (outputdir,label),bbox_inches='tight')
+        min_x = min(np.amin(y_hls[:, i]), np.amin(y_class[:, i]))
+        max_x = max(np.amax(y_hls[:, i]), np.amax(y_class[:, i]))
+        figure = plot_2d(
+            np.array(y_class[:, i]),
+            np.array(y_hls[:, i]),
+            (min_x, max_x),
+            (min_x, max_x),
+            "Tensorflow",
+            "hls4ml",
+            style.CLASS_LABEL_STYLE[label] + " score",
+        )
+        figure.savefig("%s/%s_score_2D.png" % (outputdir, label), bbox_inches='tight')
+        figure.savefig("%s/%s_score_2D.pdf" % (outputdir, label), bbox_inches='tight')
 
     plt.clf()
-    figure = plot_2d(y_ptreg[:,0] ,y_ptreg_hls[:,0],
-                     ( min(np.amin(y_ptreg_hls), np.amin(y_ptreg)),max(np.amax(y_ptreg_hls), np.amax(y_ptreg))),
-                     ( min(np.amin(y_ptreg_hls), np.amin(y_ptreg)),max(np.amax(y_ptreg_hls), np.amax(y_ptreg))),
-                     "Tensorflow","hls4ml","Regression score")
-    plt.savefig("%s/%s_score_2D.png" % (outputdir,"Regression"),bbox_inches='tight')
-    plt.savefig("%s/%s_score_2D.pdf" % (outputdir,"Regression"),bbox_inches='tight')
+    figure = plot_2d(
+        y_ptreg[:, 0],
+        y_ptreg_hls[:, 0],
+        (min(np.amin(y_ptreg_hls), np.amin(y_ptreg)), max(np.amax(y_ptreg_hls), np.amax(y_ptreg))),
+        (min(np.amin(y_ptreg_hls), np.amin(y_ptreg)), max(np.amax(y_ptreg_hls), np.amax(y_ptreg))),
+        "Tensorflow",
+        "hls4ml",
+        "Regression score",
+    )
+    figure.savefig("%s/%s_score_2D.png" % (outputdir, "Regression"), bbox_inches='tight')
+    figure.savefig("%s/%s_score_2D.pdf" % (outputdir, "Regression"), bbox_inches='tight')
     plt.close()
 
-    wp, wph, ap, aph = hls4ml.model.profiling.numerical(model=model, hls_model=hls_model, X=X_test)
-    ap.savefig(outputdir+"/model_activations_profile.png")
-    wp.savefig(outputdir+"/model_weights_profile.png")
-    aph.savefig(outputdir+"/model_activations_profile_opt.png")
-    wph.savefig(outputdir+"/model_weights_profile_opt.png")
+    try:
+        wp, wph, ap, aph = profiling.numerical(model=model.jet_model, hls_model=model.hls_jet_model, X=hls_inputs)
+        ap.savefig(outputdir + "/model_activations_profile.png")
+        wp.savefig(outputdir + "/model_weights_profile.png")
+        aph.savefig(outputdir + "/model_activations_profile_opt.png")
+        wph.savefig(outputdir + "/model_weights_profile_opt.png")
+    except:
+        print("Error in profiling, use updated version of hls4ml (1.4.0 or later)")
 
-    y_hls, hls4ml_trace = hls_model.trace(np.ascontiguousarray(X_test))
-    keras_trace = hls4ml.model.profiling.get_ymodel_keras(model, X_test)
+    y_hls, hls4ml_trace = model.hls_jet_model.trace(hls_inputs)
 
+    # Run prediction to get activations
+    keras_trace_model = model.get_keras_trace_model()
+    keras_activations = keras_trace_model.predict(model_dict)
+
+    # Convert keras activations to a dict keyed by layer name
+    keras_trace = {layer.name: act for layer, act in zip(model.jet_model.layers, keras_activations)}
+
+    # --- Profiling plots ---
+    print(len(model_dict['basic_input']), "inputs to the model")
     for layer in hls4ml_trace.keys():
-        print ("Doing profiling 2d for layer", layer)
+        print("Doing profiling 2d for layer", layer)
+
         min_x = min(np.amin(hls4ml_trace[layer]), np.amin(keras_trace[layer]))
         max_x = max(np.amax(hls4ml_trace[layer]), np.amax(keras_trace[layer]))
-        plot_2d(hls4ml_trace[layer].flatten() ,keras_trace[layer].flatten(),
-                     (min_x,max_x),
-                     ( min_x,max_x),
-                     "hls4ml {}".format(layer),"Tensorflow  {}".format(layer),layer +" agreement")
+
+        plot_2d(
+            hls4ml_trace[layer].flatten(),
+            keras_trace[layer].flatten(),
+            (min_x, max_x),
+            (min_x, max_x),
+            "hls4ml {}".format(layer),
+            "Tensorflow {}".format(layer),
+            layer + " agreement",
+        )
+
+        # Add diagonal line
         plt.plot([min_x, max_x], [min_x, max_x], c="gray")
-        plt.savefig(f"{outputdir}/profile_2d_{layer}.png",bbox_inches='tight')
-        plt.savefig(f"{outputdir}/profile_2d_{layer}.pdf",bbox_inches='tight')
+
+        # Save plots
+        plt.savefig(f"{outputdir}/profile_2d_{layer}.png", bbox_inches='tight')
+        plt.savefig(f"{outputdir}/profile_2d_{layer}.pdf", bbox_inches='tight')
         plt.close()
 
     return
 
+
 if __name__ == "__main__":
 
     parser = ArgumentParser()
-    parser.add_argument('-m','--model', default='output/baseline/model/saved_model.h5' , help = 'Input model path for comparison')
-    parser.add_argument('-o','--outpath', default='output/baseline/plots/profile' , help = 'Jet tagger plotting directory')
-    parser.add_argument('-of','--outpath_firmware', default='output/baseline/model/firmware' , help = 'Jet tagger firmware directory')
-    parser.add_argument('-i','--input', default='data/jetTuple_extended_5.root' , help = 'Path to profiling data rootfile')
-    parser.add_argument('-r','--remake', default=False , help = 'Remake profiling data? ')
-    parser.add_argument('-n','--name',default='baseline', help= 'Mlfow model name? ')
+    parser.add_argument('-m', '--model_path', default='output/baseline', help='Input model path for comparison')
+    parser.add_argument('-o', '--outpath', default='output/baseline/plots/profile', help='Jet tagger plotting directory')
+    parser.add_argument(
+        '-of', '--outpath_firmware', default='output/baseline/firmware', help='Jet tagger firmware directory'
+    )
+    parser.add_argument('-i', '--input', default='/eos/cms/store/cmst3/group/l1tr/sewuchte/l1teg/fp_jettuples_220926_170X_v0.1/All200_part6.root', help='Path to profiling data rootfile')
+    parser.add_argument('-r', '--remake', default=False, help='Remake profiling data? ')
+    parser.add_argument('-y', '--yaml_config', default='tagger/model/configs/baseline.yaml', help='YAML config for model')
 
     args = parser.parse_args()
 
-    #Load the model
-    model=load_qmodel(args.model)
-    print(model.summary())
+    model = fromFolder(args.model_path)
 
     if args.remake:
-        make_data(infile=args.input,outdir="profiling_data/",extras='extra_emulation_fields',tree="outnano/Jets")
+        make_data(infile=args.input,
+                  outdir="profiling_data/",
+                  extras='extra_emulation_fields',
+                  tree="outnano/Jets")
 
-    doPlots(model,args.outpath,"profiling_data/")
+    doPlots(model, args.outpath, "profiling_data/")
 
-    precisions = convert(model,args.outpath_firmware)
-    report = getReports('tagger/firmware/L1TSC4NGJetModel')
-    
-    if os.path.isfile("mlflow_run_id.txt"):
-
-        f = open("mlflow_run_id.txt", "r")
-        run_id = (f.read())
-        mlflow.get_experiment_by_name(os.getenv('CI_COMMIT_REF_NAME'))
-        with mlflow.start_run(experiment_id=1,
-                            run_name=args.name,
-                            run_id=run_id # pass None to start a new run
-                            ):
-            mlflow.log_metric('FF',report['ff_rel'])
-            mlflow.log_metric('LUT',report['lut_rel'])
-            mlflow.log_metric('BRAM',report['bram_rel'])
-            mlflow.log_metric('DSP',report['dsp_rel'])
-            mlflow.log_metric('Latency cc',report['latency_clks'])
-            mlflow.log_metric('Latency us',report['latency_mus'])
-            mlflow.log_metric('Initiation Interval ',report['latency_ii'])
-    
-            mlflow.log_param('Input Precision ',precisions[0])
-            mlflow.log_param('Class Precision ',precisions[1])
-            mlflow.log_param('Regression Precision ',precisions[2])
+    report = getReports(args.outpath_firmware + '/' + model.firmware_config['project_name'])
 
     print("===================")
-    print('Input Precision : ',  precisions[0])
-    print('Class Precision : ', precisions[1])
-    print('Regression Precision : ', precisions[2],' %')
+    print('Input Precision : ', model.firmware_config['input_precision'])
+    print('Class Precision : ', model.firmware_config['class_precision'])
+    print('Regression Precision : ', model.firmware_config['reg_precision'])
     print(" Resource Usage of a VU13P")
-    print('Flip Flops : ', report['ff_rel'],' %')
-    print('Look Up Tables : ', report['lut_rel'],' %')
-    print('Block RAM : ', report['bram_rel'],' %')
-    print('Digital Signal Processors : ', report['dsp_rel'],' %')
-    print('Latency : ', report['latency_clks'],' clock cycles')
-    print('Latency : ', report['latency_mus'],' mus')
-    print('Initiation Interval : ', report['latency_mus'],' clock cycles')
+    print('Flip Flops : ', report['ff_rel'], ' %')
+    print('Look Up Tables : ', report['lut_rel'], ' %')
+    print('Block RAM : ', report['bram_rel'], ' %')
+    print('Digital Signal Processors : ', report['dsp_rel'], ' %')
+    print('Latency : ', report['latency_clks'], ' clock cycles')
+    print('Latency : ', report['latency_clks'] * model.firmware_config['clock_period'] * 1e-3, ' mus')
+    print('Initiation Interval : ', report['latency_ii'], ' clock cycles')
     print("===================")
-        
-

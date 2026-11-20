@@ -12,16 +12,16 @@ import hls4ml
 import numpy as np
 import numpy.typing as npt
 import tensorflow as tf
-import tensorflow_model_optimization as tfmot
+# import tensorflow_model_optimization as tfmot
 from schema import Schema, And, Use, Optional
 
 # Qkeras
 from qkeras.quantizers import quantized_bits
-from qkeras.utils import load_qmodel
+# from qkeras.utils import load_qmodel
 from tensorflow.keras.callbacks import EarlyStopping, ReduceLROnPlateau, ModelCheckpoint
 from tensorflow.keras import Model
 
-from tagger.model.common_tensorflow import huber_loss, AAtt, AttentionPooling, choose_aggregator
+# from tagger.model.common_tensorflow import huber_loss, AAtt, AttentionPooling, choose_aggregator
 from tagger.model.JetTagModel import JetModelFactory, JetTagModel
 from tagger.data.tools import constituents_mask
 

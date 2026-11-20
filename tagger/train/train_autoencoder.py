@@ -1,0 +1,204 @@
+import os
+from argparse import ArgumentParser
+
+# Third parties
+import numpy as np
+
+# Import from other modules
+from tagger.data.tools import load_data, to_ML
+from tagger.model.common import fromFolder, fromYaml
+from tagger.plot.basic import basic
+
+
+def save_test_data(out_dir, test_dict, y_test, truth_pt_test, reco_pt):
+
+    os.makedirs(os.path.join(out_dir, 'testing_data'), exist_ok=True)
+    np.savez_compressed(os.path.join(out_dir, "testing_data/test_dict.npz"), **test_dict)
+    np.savez_compressed(os.path.join(out_dir, "testing_data/y_test.npz"), label=y_test)
+    np.savez_compressed(os.path.join(out_dir, "testing_data/truth_pt_test.npz"), truth_pt=truth_pt_test)
+    np.savez_compressed(os.path.join(out_dir, "testing_data/reco_pt_test.npz"), reco_pt=reco_pt)
+
+    print(f"Test labels saved to {out_dir}")
+
+
+def train_weights(y_train, reco_pt_train, class_labels, weightingMethod, debug, low_pt=False):
+    """
+    Re-balancing the class weights and then flatten them based on truth pT
+    """
+    if weightingMethod not in ["none", "ptref", "onlyclass"]:
+        raise ValueError(
+            "Oops!  Given weightingMethod not defined in train_weights(). Use either none, ptref, or onlyclass."
+        )
+    # if weightingMethod == "onlypt":
+    #     return flat_pt_weights(reco_pt_train)
+    num_samples = y_train.shape[0]
+
+    sample_weights = np.ones(num_samples)
+
+    # Define pT bins (without the high pT part we don't care about)
+    pt_bins = np.array(
+        [15, 17, 19, 22, 25, 30, 35, 40, 45, 50, 60, 76, 97, 122, 154, np.inf]
+    )  # Use np.inf to cover all higher values
+
+    if weightingMethod == "onlyclass":
+        pt_bins = np.array([0.0, np.inf])  # Use np.inf to cover all higher values
+
+    # Initialize counts per class per pT bin
+    class_pt_counts = {}
+
+    # Calculate counts per class per pT bin
+    for _label, idx in class_labels.items():
+        class_mask = y_train[:, idx] == 1
+        class_pt_counts[idx], _ = np.histogram(reco_pt_train[class_mask], bins=pt_bins)
+
+    # Compute the maximum counts per pT bin over all classes
+    max_counts_per_bin = np.zeros(len(pt_bins) - 1)
+    min_counts_per_bin = np.zeros(len(pt_bins) - 1)
+    for bin_idx in range(len(pt_bins) - 1):
+        counts_in_bin = [class_pt_counts[idx][bin_idx] for idx in class_labels.values()]
+        max_counts_per_bin[bin_idx] = max(counts_in_bin)
+        min_counts_per_bin[bin_idx] = min(counts_in_bin)
+
+    # Weight all to one base class (b = 0)
+    counts_per_bin = class_pt_counts[0]
+
+    if weightingMethod == "ptref":
+        # Try minimum and flat
+        counts_per_bin = [min(min_counts_per_bin) for __ in min_counts_per_bin]
+        # Try maximum and flat
+        # counts_per_bin = [max(max_counts_per_bin) for __ in max_counts_per_bin]
+
+    # Compute weights per class per pT bin
+    weights_per_class_pt_bin = {}
+    for idx in class_labels.values():
+        weights_per_class_pt_bin[idx] = np.zeros(len(pt_bins) - 1)
+        for bin_idx in range(len(pt_bins) - 1):
+            class_count = class_pt_counts[idx][bin_idx]
+            if class_count == 0:
+                weights_per_class_pt_bin[idx][bin_idx] = 0.0
+            else:
+                weights_per_class_pt_bin[idx][bin_idx] = counts_per_bin[bin_idx] / class_count
+
+    # Multiply by some custom class weights
+    # All same weight
+    weights_per_class = {
+        0: 1,  # b
+        1: 1,  # charm
+        2: 1.0,  # light
+        3: 1.0,  # gluon
+        4: 1.0,  # taup
+        5: 1.0,  # taum
+        6: 1.0,  # muon
+        7: 1.0,  # electron
+    }
+    if model.training_config['pileup']:
+        weights_per_class[8] = 1.0  # pileup
+
+    for idx in class_labels.values():
+        weights_per_class_pt_bin[idx] = weights_per_class_pt_bin[idx] * weights_per_class[idx]
+
+    # Assign weights to samples
+    for idx in class_labels.values():
+        class_mask = y_train[:, idx] == 1
+        class_truth_pt = reco_pt_train[class_mask]
+        sample_indices = np.where(class_mask)[0]
+        # Subtract 1 to get 0-based index
+        bin_indices = np.digitize(class_truth_pt, pt_bins) - 1
+        # Handle right edge
+        bin_indices[bin_indices == len(pt_bins) - 1] = len(pt_bins) - 2
+        sample_weights[sample_indices] = weights_per_class_pt_bin[idx][bin_indices]
+
+        # Print weighted jets as closure test in debug mode
+        if debug and weightingMethod != "none":
+            print("DEBUG - Checking jets weighted by sample_weights as a function of pT:")
+            print(np.histogram(class_truth_pt, bins=pt_bins, weights=sample_weights[sample_indices]))
+
+    # Normalize sample weights
+    sample_weights = sample_weights / np.mean(sample_weights)
+
+    # pt ref
+    if weightingMethod == "ptref":
+        sample_weights = sample_weights * reco_pt_train
+        sample_weights = sample_weights / np.mean(sample_weights)
+
+    if weightingMethod == "none":
+        return None
+    return sample_weights
+
+def train(model, out_dir, percent):
+
+    # Load the data, class_labels and input variables name, not really using input variable names to be honest
+    data_train, data_test, class_labels, input_vars, jet_vars, extra_vars = load_data("training_data/", percent, model)
+    input_vars = [var for var in input_vars if var in model.inputs['basic_input_config']] # keep only the input variables that are in the model's input config
+    jet_vars = [var for var in jet_vars if var in model.inputs['jet_features']]
+    model.set_labels(
+        input_vars,
+        jet_vars,
+        extra_vars,
+        class_labels,
+    )
+
+    # Make into ML-like data for training
+    particle_features_train, jet_features_train, y_train, pt_target_train, _, reco_pt_train = to_ML(data_train, class_labels)
+
+    # Save particle_features_test, y_test, and truth_pt_test for plotting later
+    particle_features_test, jet_features_test, y_test, _, truth_pt_test, reco_pt_test = to_ML(data_test, class_labels)
+
+    # collect all possible train and test inputs
+    raw_inputs_train = {
+        'basic_input': particle_features_train,
+        'jet_features': jet_features_train,
+    }
+
+    raw_inputs_test = {
+        'basic_input': particle_features_test,
+        'jet_features': jet_features_test,
+    }
+    test_dict, _ = model.prepare_inputs(raw_inputs_test)  # to set the input keys
+    # save_test_data(out_dir, test_dict, y_test, truth_pt_test, reco_pt_test)
+
+    # Calculate the sample weights for training
+    jet_weights = []
+    for w in model.training_config['weight_method']:
+        sample_weight_class = train_weights(
+            y_train,
+            reco_pt_train,
+            class_labels,
+            weightingMethod=w,
+            debug=model.run_config['debug'],
+        )
+        jet_weights.append(sample_weight_class)
+
+    # Get input shape and inputs dict
+    train_dict, input_shapes = model.prepare_inputs(raw_inputs_train)
+    output_shape = y_train.shape[1:]
+    num_samples = particle_features_train.shape[0] * (1 - model.training_config['validation_split'])
+
+    # model.build_model(input_shapes, output_shape)
+    # model.compile_model(num_samples)
+    # model.fit(train_dict, y_train, pt_target_train, jet_weights)
+
+    # Train the autoencoder on the frozen, fully-trained jet embeddings.
+    if model.autoencoder_config:
+        model.configure_autoencoder()
+        model.fit_autoencoder(train_dict, jet_weights)
+    else:
+        print("No autoencoder config found")
+
+    # Finished training, save model
+    model.save()
+    model.plot_embedding_metrics()
+    model.plot_loss()
+
+    return
+
+
+if __name__ == "__main__":
+
+    parser = ArgumentParser()
+    parser.add_argument('-o', '--output', default='output/baseline', help='Output model directory path, also save evaluation plots')
+    parser.add_argument('-p', '--percent', default=100, type=int, help='Percentage of how much processed data to train on')
+    args = parser.parse_args()
+
+    model = fromFolder(args.output)
+    train(model, args.output, args.percent)

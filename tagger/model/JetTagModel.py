@@ -10,10 +10,11 @@ from abc import ABC, abstractmethod
 
 import numpy as np
 import numpy.typing as npt
+import keras
 import yaml
 from schema import Schema, And, Use, Optional
 
-from tagger.plot.basic import loss_history
+from tagger.plot.basic import loss_history, metrics_history
 
 class JetTagModel(ABC):
     """Parent Class for Jet Tag Models
@@ -30,6 +31,8 @@ class JetTagModel(ABC):
 
         self.jet_model = None
         self.hls_jet_model = None
+        self.encoder_model = None
+        self.autoencoder_model = None
 
         self.particle_input_vars = []
         self.jet_input_vars = []
@@ -38,6 +41,7 @@ class JetTagModel(ABC):
 
         self.run_config = {}
         self.model_config = {}
+        self.autoencoder_config = {}
         self.quantization_config = {}
         self.training_config = {}
         self.firmware_config = {}
@@ -73,6 +77,8 @@ class JetTagModel(ABC):
         self.inputs = yaml_dict['inputs']
         if "firmware_config" in yaml_dict:
             self.firmware_config = yaml_dict['firmware_config']
+        if "autoencoder_config" in yaml_dict:
+            self.autoencoder_config = yaml_dict['autoencoder_config']
 
     @abstractmethod
     def build_model(self, **kwargs):
@@ -100,7 +106,7 @@ class JetTagModel(ABC):
         Must be written for child class if you want to run the synthesis steps
         """
 
-    def predict(self, particle_features_test: npt.NDArray[np.float64]) -> tuple:
+    def predict(self, particle_features_test: npt.NDArray[np.float64], **kwargs) -> tuple:
         """Predict method for model
 
         Args:
@@ -109,10 +115,23 @@ class JetTagModel(ABC):
         Returns:
             tuple: (class_predictions , pt_ratio_predictions)
         """
-        model_outputs = self.jet_model.predict(particle_features_test)
+        model_outputs = self.jet_model.predict(particle_features_test, **kwargs)
         class_predictions = model_outputs[0]
         pt_ratio_predictions = model_outputs[1].flatten()
         return (class_predictions, pt_ratio_predictions)
+
+    def embed(self, particle_features_test: npt.NDArray[np.float64], **kwargs) -> npt.NDArray[np.float64]:
+        """Predict method for model
+
+        Args:
+            particle_features_test (npt.NDArray[np.float64]): Input X test
+
+        Returns:
+            np.ndarray: jet embedding
+        """
+        if self.encoder_model is None:
+            self.encoder_model = keras.Model(self.jet_model.input, self.jet_model.get_layer('pool').output)
+        return self.encoder_model.predict(particle_features_test, **kwargs)
 
     def save_decorator(save_func):
         """Decorator used to include additional
@@ -203,6 +222,21 @@ class JetTagModel(ABC):
 
         # Plot history
         loss_history(plot_path, [self.loss_name + self.output_id_name, self.loss_name + self.output_pt_name], self.history)
+
+    def plot_embedding_metrics(self):
+        """Plot encoder and autoencoder callback metrics when available."""
+
+        plot_path = os.path.join(self.output_directory, "plots/training")
+        os.makedirs(plot_path, exist_ok=True)
+
+        for csv_name in (
+            "encoder_embedding_metrics.csv",
+            "autoencoder_metrics.csv",
+        ):
+            metrics_history(
+                plot_path,
+                os.path.join(self.output_directory, csv_name),
+            )
 
 
 class JetModelFactory:

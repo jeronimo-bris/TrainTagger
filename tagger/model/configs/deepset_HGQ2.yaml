@@ -1,0 +1,94 @@
+model: DeepSetModelHGQ2
+run_config:
+  verbose: 2
+  debug: true
+  num_threads: 24
+
+model_config:
+  name: baseline_HGQ2
+  conv1d_layers: [32, 32]
+  classification_layers: [32, 16]
+  regression_layers: [10]
+  kernel_initializer: lecun_uniform
+  aggregator: mean
+
+quantization_config:
+  quantizer_bits: 9
+  quantizer_bits_int: 2
+  reg_quantizer_bits: 11
+  reg_quantizer_bits_int: 2
+  quantizer_alpha_val: 1.0
+  pt_output_quantization: [16, 6]
+
+inputs:
+  basic_input_config:
+    [
+      "pt",
+      "pt_rel",
+      "pt_log",
+      "deta",
+      "dphi",
+      "mass",
+      "isPhoton",
+      "isElectronPlus",
+      "isElectronMinus",
+      "isMuonPlus",
+      "isMuonMinus",
+      "isNeutralHadron",
+      "isChargedHadronPlus",
+      "isChargedHadronMinus",
+      "z0",
+      "dxy",
+      "isfilled",
+      "puppiweight",
+      "emid",
+      "quality",
+    ]
+  basic_features: [basic_input]
+  jet_features: []
+
+training_config:
+  weight_method: [onlyclass, onlyclass]
+  epochs: 500
+  batch_size: 2048
+  learning_rate: 0.001
+  validation_split: 0.1
+
+  loss_weights: [1, 1]
+  huber_weights: [0, 0]
+  huber_delta: 1.0
+
+  target_ebops: 300000
+  EarlyStopping_patience: 20
+  ReduceLROnPlateau_factor: 0.5
+  ReduceLROnPlateau_patience: 10
+  ReduceLROnPlateau_min_lr: 0.0000001
+
+  pileup: false
+
+  embedding_monitor:
+    enabled: true
+    sample_size: 20000
+    batch_size: 20000
+    every_n_epochs: 1
+
+autoencoder_config:
+  layers: [12, 4, 12]
+  l2_normalize: true
+  epochs: 500
+  batch_size: 2048
+  learning_rate: 0.001
+  validation_split: 0.1
+  target_ebops: 100000
+  EarlyStopping_patience: 10
+  ReduceLROnPlateau_factor: 0.5
+  ReduceLROnPlateau_patience: 10
+  ReduceLROnPlateau_min_lr: 0.0000001
+
+firmware_config:
+  input_precision: { basic_input: "ap_fixed<24,12,AP_RND,AP_SAT>" }
+  class_precision: "ap_ufixed<24,12,AP_RND,AP_SAT>"
+  reg_precision: "ap_fixed<16,6,AP_RND,AP_SAT>"
+  clock_period: 2.5
+  fpga_part: xcvu13p-flga2577-2-e
+  project_name: L1TSC4NGJetModelHGQ2

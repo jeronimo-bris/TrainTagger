@@ -60,6 +60,46 @@ def loss_history(plot_dir, loss_names, history):
         fig.clf()
 
 
+def metrics_history(plot_dir, csv_path):
+    """Plot every scalar metric in a callback-generated CSV against epoch."""
+
+    if not os.path.exists(csv_path):
+        return
+
+    metrics = pandas.read_csv(csv_path)
+    if "epoch" not in metrics.columns:
+        raise ValueError(f"Metrics CSV does not contain an epoch column: {csv_path}")
+
+    metric_name = os.path.splitext(os.path.basename(csv_path))[0]
+    metric_plot_dir = os.path.join(plot_dir, metric_name)
+    os.makedirs(metric_plot_dir, exist_ok=True)
+
+    for metric in metrics.columns:
+        if metric == "epoch":
+            continue
+
+        values = pandas.to_numeric(metrics[metric], errors="coerce")
+        if values.isna().all():
+            continue
+
+        fig, ax = plt.subplots(1, 1, figsize=style.FIGURE_SIZE)
+        hep.cms.label(
+            llabel=style.CMSHEADER_LEFT,
+            rlabel=style.CMSHEADER_RIGHT,
+            ax=ax,
+            fontsize=style.CMSHEADER_SIZE,
+        )
+        ax.plot(metrics["epoch"], values, linewidth=style.LINEWIDTH,)
+        ax.grid(True)
+        ax.set_ylabel(metric.replace("_", " "))
+        ax.set_xlabel("Epoch")
+
+        save_path = os.path.join(metric_plot_dir, f"{metric}_history")
+        fig.savefig(f"{save_path}.png", bbox_inches="tight")
+        fig.savefig(f"{save_path}.pdf", bbox_inches="tight")
+        plt.close(fig)
+
+
 def ROC_taus(y_pred, y_test, class_labels, plot_dir, signal_proc=None):
     """
     Plot ROC curves for taus vs jets and leptons

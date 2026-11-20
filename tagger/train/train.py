@@ -29,8 +29,8 @@ def train_weights(y_train, reco_pt_train, class_labels, weightingMethod, debug, 
         raise ValueError(
             "Oops!  Given weightingMethod not defined in train_weights(). Use either none, ptref, or onlyclass."
         )
-    if weightingMethod == "onlypt":
-        return flat_pt_weights(reco_pt_train)
+    # if weightingMethod == "onlypt":
+    #     return flat_pt_weights(reco_pt_train)
     num_samples = y_train.shape[0]
 
     sample_weights = np.ones(num_samples)
@@ -172,18 +172,21 @@ def train(model, out_dir, percent):
     # Get input shape and inputs dict
     train_dict, input_shapes = model.prepare_inputs(raw_inputs_train)
     output_shape = y_train.shape[1:]
-
-    model.build_model(input_shapes, output_shape)
-
-    # Train it with a pruned model
     num_samples = particle_features_train.shape[0] * (1 - model.training_config['validation_split'])
 
+    model.build_model(input_shapes, output_shape)
     model.compile_model(num_samples)
     model.fit(train_dict, y_train, pt_target_train, jet_weights)
+
+    # Train the autoencoder on the frozen, fully-trained jet embeddings.
+    if model.autoencoder_config:
+        model.configure_autoencoder()
+        model.fit_autoencoder(train_dict, jet_weights)
 
     # Finished training, save model
     model.save()
 
+    model.plot_embedding_metrics()
     model.plot_loss()
 
     return
